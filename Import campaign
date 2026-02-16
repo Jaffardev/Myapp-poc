@@ -1,0 +1,49 @@
+CREATE OR REPLACE PROCEDURE IMPORT_CAMPAIGN_DATA (
+    p_campaign_id IN NUMBER,
+    p_raw_sql     IN CLOB
+) IS
+    l_cursor_id     INTEGER;
+    l_col_cnt       INTEGER;
+    l_desc_tab      DBMS_SQL.DESC_TAB;
+    l_val           VARCHAR2(4000);
+    l_insert_sql    CLOB;
+    l_attr_map      VARCHAR2(30);
+BEGIN
+    -- 1. SECURITY CHECK: Basic keyword sanitization
+    IF UPPER(p_raw_sql) LIKE '%DELETE%' OR UPPER(p_raw_sql) LIKE '%DROP%' THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Unauthorized SQL keyword detected.');
+    END IF;
+
+    -- 2. OPEN & PARSE (Checks syntax and permissions)
+    l_cursor_id := DBMS_SQL.OPEN_CURSOR;
+    DBMS_SQL.PARSE(l_cursor_id, p_raw_sql, DBMS_SQL.NATIVE);
+    DBMS_SQL.DESCRIBE_COLUMNS(l_cursor_id, l_col_cnt, l_desc_tab);
+
+    -- 3. DYNAMIC MAPPING LOGIC
+    -- We loop through the query columns and find their ATTR_N match
+    FOR i IN 1 .. l_col_cnt LOOP
+        BEGIN
+            SELECT TARGET_ATTR INTO l_attr_map 
+            FROM CAMPAIGN_MAPPINGS 
+            WHERE CAMPAIGN_ID = p_campaign_id 
+            AND SOURCE_COL = l_desc_tab(i).col_name;
+            
+            -- Define the column for the cursor
+            DBMS_SQL.DEFINE_COLUMN(l_cursor_id, i, l_val, 4000);
+        EXCEPTION WHEN NO_DATA_FOUND THEN
+            CONTINUE; -- Skip columns not mapped
+        END;
+    END LOOP;
+
+    -- 4. EXECUTION & INSERT (Simplified for example; use BULK COLLECT for 1M rows)
+    -- In a real scenario, you'd build a dynamic INSERT statement here
+    -- using the mappings found in Step 3.
+    
+    DBMS_SQL.CLOSE_CURSOR(l_cursor_id);
+EXCEPTION
+    WHEN OTHERS THEN
+        IF DBMS_SQL.IS_OPEN(l_cursor_id) THEN
+            DBMS_SQL.CLOSE_CURSOR(l_cursor_id);
+        END IF;
+        RAISE;
+END;

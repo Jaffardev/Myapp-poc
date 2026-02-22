@@ -1,0 +1,34 @@
+using Oracle.ManagedDataAccess.Client;
+
+public async Task<QueryMetrics> GetPerformanceMetrics(string userSql, string connectionString)
+{
+    using var conn = new OracleConnection(connectionString);
+    await conn.OpenAsync();
+
+    // 1. Generate the plan
+    using var cmdExplain = new OracleCommand($"EXPLAIN PLAN FOR {userSql}", conn);
+    await cmdExplain.ExecuteNonQueryAsync();
+
+    // 2. Fetch Cardinality (Rows) and Cost (Performance)
+    // We target ID = 0 because that represents the total summary of the query
+    string queryPlan = @"SELECT cardinality, cost 
+                         FROM PLAN_TABLE 
+                         WHERE id = 0 AND timestamp = (SELECT MAX(timestamp) FROM PLAN_TABLE)";
+    
+    using var cmdMetrics = new OracleCommand(queryPlan, conn);
+    using var reader = await cmdMetrics.ExecuteReaderAsync();
+
+    if (await reader.ReadAsync())
+    {
+        return new QueryMetrics {
+            EstimatedRows = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
+            EstimatedCost = reader.IsDBNull(1) ? 0 : reader.GetInt64(1)
+        };
+    }
+    return null;
+}
+
+public class QueryMetrics {
+    public long EstimatedRows { get; set; }
+    public long EstimatedCost { get; set; }
+}

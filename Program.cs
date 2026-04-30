@@ -1,202 +1,259 @@
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
-using System.Net.Http.Json;
+using System.Linq;
+using System.Net.Http;
+using System.ServiceModel;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
-// ──────────────────────────────────────────────
-//  CONFIG — tweak these before running
-// ──────────────────────────────────────────────
-const string TARGET_URL      = "https://localhost:7001/api/your-endpoint"; // ← change me
-const int    VIRTUAL_USERS   = 100;
-const int    REQUESTS_PER_USER = 10;
-const int    MAX_CONNECTIONS = 200;   // ServicePointManager / SocketsHttpHandler limit
-const int    TIMEOUT_SECONDS = 30;
-const int    STATS_INTERVAL_MS = 1000; // how often the live dashboard refreshes
+// ═══════════════════════════════════════════════════════════════════
+//  SOAP SINGLETON VALIDATOR — Console App
+//  Proves that ONE SoapClient instance handles ALL parallel requests
+// ═══════════════════════════════════════════════════════════════════
 
-// ──────────────────────────────────────────────
-//  GRACEFUL CANCELLATION  (Ctrl+C)
-// ──────────────────────────────────────────────
-using var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) =>
+Console.ForegroundColor = ConsoleColor.Cyan;
+Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
+Console.WriteLine("║       SOAP INSTANCE COUNT VALIDATOR                     ║");
+Console.WriteLine("║       ASP.NET Core — Singleton vs Transient Test        ║");
+Console.WriteLine("╚══════════════════════════════════════════════════════════╝");
+Console.ResetColor();
+Console.WriteLine();
+
+// ── Run all three test scenarios ─────────────────────────────────
+await RunTest("SINGLETON (Correct Approach)",
+    services => services.AddSingleton<ICardSoapClient, CardSoapClient>(),
+    ConsoleColor.Green);
+
+Console.WriteLine();
+
+await RunTest("SCOPED (Wrong — creates per-request)",
+    services => services.AddScoped<ICardSoapClient, CardSoapClient>(),
+    ConsoleColor.Yellow);
+
+Console.WriteLine();
+
+await RunTest("TRANSIENT (Wrong — worst case)",
+    services => services.AddTransient<ICardSoapClient, CardSoapClient>(),
+    ConsoleColor.Red);
+
+Console.WriteLine();
+PrintFinalSummary();
+
+// ═══════════════════════════════════════════════════════════════════
+//  TEST RUNNER
+// ═══════════════════════════════════════════════════════════════════
+static async Task RunTest(
+    string label,
+    Action<IServiceCollection> register,
+    ConsoleColor color)
 {
-    e.Cancel = true;   // prevent hard kill; let us flush stats first
-    Console.WriteLine("\n[!] Ctrl+C received — stopping after in-flight requests finish…");
-    cts.Cancel();
-};
+    const int PARALLEL_REQUESTS = 20;
 
-// ──────────────────────────────────────────────
-//  HTTP CLIENT  (single static instance — best practice)
-// ──────────────────────────────────────────────
-using var handler = new SocketsHttpHandler
-{
-    PooledConnectionLifetime    = TimeSpan.FromMinutes(5),
-    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-    MaxConnectionsPerServer     = MAX_CONNECTIONS,
-    EnableMultipleHttp2Connections = true,
-};
-using var httpClient = new HttpClient(handler)
-{
-    BaseAddress = new Uri(TARGET_URL),
-    Timeout     = TimeSpan.FromSeconds(TIMEOUT_SECONDS),
-};
-httpClient.DefaultRequestHeaders.Add("User-Agent", "StressTest/1.0 (.NET 10)");
+    // Reset static counters before each test
+    CardSoapClient.Reset();
 
-// ──────────────────────────────────────────────
-//  SHARED COUNTERS  (lock-free)
-// ──────────────────────────────────────────────
-long totalCompleted = 0;
-long totalSucceeded = 0;
-long totalFailed    = 0;
-long totalElapsedMs = 0; // sum of all response times → used for avg
+    // ── Build DI container ────────────────────────────────────────
+    var services = new ServiceCollection();
+    services.AddLogging(b => b.SetMinimumLevel(LogLevel.None));
+    register(services);
+    var provider = services.BuildServiceProvider();
 
-var errors = new ConcurrentDictionary<string, int>(); // error message → count
+    // ── Header ────────────────────────────────────────────────────
+    Console.ForegroundColor = color;
+    Console.WriteLine($"┌─ TEST: {label}");
+    Console.ResetColor();
+    Console.WriteLine($"│  Firing {PARALLEL_REQUESTS} parallel requests...");
+    Console.WriteLine("│");
 
-// ──────────────────────────────────────────────
-//  LIVE STATS TASK
-// ──────────────────────────────────────────────
-var statsTask = Task.Run(async () =>
-{
-    while (!cts.Token.IsCancellationRequested)
+    var results  = new ConcurrentBag<RequestResult>();
+    var sw       = Stopwatch.StartNew();
+
+    // ── Fire N parallel requests ──────────────────────────────────
+    var tasks = Enumerable.Range(1, PARALLEL_REQUESTS).Select(async i =>
     {
-        await Task.Delay(STATS_INTERVAL_MS, cts.Token).ContinueWith(_ => { }); // swallow cancel
-        PrintStats();
+        // Simulate per-request scope (like ASP.NET Core does)
+        await using var scope = provider.CreateAsyncScope();
+        var client = scope.ServiceProvider.GetRequiredService<ICardSoapClient>();
+
+        var reqSw = Stopwatch.StartNew();
+        var balance = await client.GetCardBalanceAsync($"4111-1111-1111-{i:0000}");
+        reqSw.Stop();
+
+        results.Add(new RequestResult(
+            RequestId:  i,
+            InstanceId: balance.FetchedByInstanceId,
+            ElapsedMs:  reqSw.ElapsedMilliseconds,
+            CardNumber: balance.MaskedCard
+        ));
+    });
+
+    await Task.WhenAll(tasks);
+    sw.Stop();
+
+    // ── Analyse results ───────────────────────────────────────────
+    var sorted         = results.OrderBy(r => r.RequestId).ToList();
+    var uniqueInstances = sorted.Select(r => r.InstanceId).Distinct().Count();
+    var totalCreated   = CardSoapClient.InstanceCount;
+    var totalCalls     = CardSoapClient.TotalCalls;
+    bool isCorrect     = totalCreated == 1;
+
+    // ── Print per-request table ───────────────────────────────────
+    Console.WriteLine("│  Request │ Instance │ Card               │ Time  │");
+    Console.WriteLine("│  ────────┼──────────┼────────────────────┼───────│");
+    foreach (var r in sorted)
+    {
+        Console.Write("│  ");
+        Console.Write($"  Req #{r.RequestId,-4}");
+        Console.Write($"  Inst #{r.InstanceId,-4}  ");
+        Console.Write($"  {r.CardNumber,-20}");
+        Console.Write($"  {r.ElapsedMs}ms");
+        Console.WriteLine();
     }
-}, cts.Token);
 
-// ──────────────────────────────────────────────
-//  MAIN STRESS TEST
-// ──────────────────────────────────────────────
-Console.WriteLine("╔══════════════════════════════════════════════════╗");
-Console.WriteLine("║        .NET 10 API Stress Tester  v1.0          ║");
-Console.WriteLine("╚══════════════════════════════════════════════════╝");
-Console.WriteLine($"  Target URL    : {TARGET_URL}");
-Console.WriteLine($"  Virtual Users : {VIRTUAL_USERS}");
-Console.WriteLine($"  Requests/User : {REQUESTS_PER_USER}");
-Console.WriteLine($"  Total Requests: {VIRTUAL_USERS * REQUESTS_PER_USER}");
-Console.WriteLine($"  Timeout       : {TIMEOUT_SECONDS}s per request");
-Console.WriteLine("  Press Ctrl+C to stop gracefully.\n");
+    Console.WriteLine("│");
 
-var overallSw = Stopwatch.StartNew();
+    // ── Print summary ─────────────────────────────────────────────
+    Console.ForegroundColor = color;
+    Console.WriteLine("│  ── RESULTS ──────────────────────────────────────");
+    Console.ResetColor();
 
-// ParallelOptions controls the outer "100 virtual users" concurrency.
-// Each user still executes its 10 calls SEQUENTIALLY inside the body.
-var parallelOpts = new ParallelOptions
+    PrintResult("│  Total requests fired",   $"{PARALLEL_REQUESTS}");
+    PrintResult("│  SoapClient instances CREATED", $"{totalCreated}",
+        totalCreated == 1 ? ConsoleColor.Green : ConsoleColor.Red);
+    PrintResult("│  Unique instances USED",  $"{uniqueInstances}",
+        uniqueInstances == 1 ? ConsoleColor.Green : ConsoleColor.Red);
+    PrintResult("│  Total SOAP calls made",  $"{totalCalls}");
+    PrintResult("│  Total elapsed time",     $"{sw.ElapsedMilliseconds}ms");
+
+    Console.WriteLine("│");
+
+    if (isCorrect)
+    {
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine("│  ✅ PASS — ONE instance served ALL requests (correct Singleton behaviour)");
+    }
+    else
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"│  ❌ FAIL — {totalCreated} instances created for {PARALLEL_REQUESTS} requests");
+        Console.WriteLine("│       This causes high CPU, memory waste, and no connection reuse!");
+    }
+
+    Console.ResetColor();
+    Console.ForegroundColor = color;
+    Console.WriteLine($"└{'─' + new string('─', label.Length + 8)}");
+    Console.ResetColor();
+}
+
+// ── Helper: coloured result line ──────────────────────────────────
+static void PrintResult(string label, string value,
+    ConsoleColor valueColor = ConsoleColor.White)
 {
-    MaxDegreeOfParallelism = VIRTUAL_USERS,
-    CancellationToken      = cts.Token,
-};
+    Console.Write($"{label,-45}: ");
+    Console.ForegroundColor = valueColor;
+    Console.WriteLine(value);
+    Console.ResetColor();
+}
 
-try
+// ── Final comparison summary ──────────────────────────────────────
+static void PrintFinalSummary()
 {
-    await Parallel.ForEachAsync(
-        Enumerable.Range(1, VIRTUAL_USERS),
-        parallelOpts,
-        async (userId, ct) =>
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
+    Console.WriteLine("║                   FINAL SUMMARY                        ║");
+    Console.WriteLine("╠══════════════════════════════════════════════════════════╣");
+    Console.WriteLine("║  Registration     │ Instances Created │ CPU Impact      ║");
+    Console.WriteLine("║  ─────────────────┼───────────────────┼──────────────── ║");
+    Console.ForegroundColor = ConsoleColor.Green;
+    Console.WriteLine("║  AddSingleton     │        1          │ ✅ Minimal       ║");
+    Console.ForegroundColor = ConsoleColor.Yellow;
+    Console.WriteLine("║  AddScoped        │  1 per request    │ ⚠️  High         ║");
+    Console.ForegroundColor = ConsoleColor.Red;
+    Console.WriteLine("║  AddTransient     │  1 per request    │ ❌ Very High     ║");
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.WriteLine("╠══════════════════════════════════════════════════════════╣");
+    Console.WriteLine("║  Use AddSingleton<ICardSoapClient, CardSoapClient>()    ║");
+    Console.WriteLine("║  in your Program.cs to fix the 70-80% CPU issue.       ║");
+    Console.WriteLine("╚══════════════════════════════════════════════════════════╝");
+    Console.ResetColor();
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  MOCK SOAP CLIENT  (simulates your real CardSoapClient behaviour)
+//  Replace this with your actual client to test against real API
+// ═══════════════════════════════════════════════════════════════════
+
+public interface ICardSoapClient
+{
+    Task<MockCardBalance> GetCardBalanceAsync(string cardNumber);
+}
+
+public class CardSoapClient : ICardSoapClient
+{
+    // ── Static counters — shared across ALL instances ─────────────
+    private static int  _instanceCount = 0;
+    private static long _totalCalls    = 0;
+    private static int  _myInstanceId;
+
+    public static int  InstanceCount => _instanceCount;
+    public static long TotalCalls    => Interlocked.Read(ref _totalCalls);
+
+    private readonly int _instanceId;
+
+    public CardSoapClient()
+    {
+        // Every time this constructor runs = a new instance created
+        _instanceId  = Interlocked.Increment(ref _instanceCount);
+        _myInstanceId = _instanceId;
+
+        // Simulate the expensive cost of creating a SOAP ChannelFactory
+        // In real code: new ChannelFactory<IExternalCardService>(binding, endpoint)
+        Thread.Sleep(15); // 15ms startup cost per instance
+    }
+
+    public async Task<MockCardBalance> GetCardBalanceAsync(string cardNumber)
+    {
+        Interlocked.Increment(ref _totalCalls);
+
+        // Simulate real SOAP network latency (50–120ms)
+        var latency = Random.Shared.Next(50, 120);
+        await Task.Delay(latency);
+
+        return new MockCardBalance
         {
-            // ── INNER SEQUENTIAL LOOP ──────────────────────────
-            for (int reqIndex = 1; reqIndex <= REQUESTS_PER_USER; reqIndex++)
-            {
-                if (ct.IsCancellationRequested) break;
+            CardNumber          = cardNumber,
+            MaskedCard          = $"**** **** **** {cardNumber[^4..]}",
+            AvailableBalance    = Math.Round(Random.Shared.NextDouble() * 10000, 2),
+            FetchedByInstanceId = _instanceId,
+            FetchedAt           = DateTime.UtcNow
+        };
+    }
 
-                var sw = Stopwatch.StartNew();
-                try
-                {
-                    // Fire the actual HTTP call.
-                    // Replace GetAsync with PostAsJsonAsync / PutAsJsonAsync as needed.
-                    using var response = await httpClient.GetAsync(
-                        string.Empty,   // BaseAddress already points at the endpoint
-                        HttpCompletionOption.ResponseHeadersRead, // don't buffer body
-                        ct);
-
-                    sw.Stop();
-
-                    // Treat any non-2xx as a failure
-                    if (response.IsSuccessStatusCode)
-                        Interlocked.Increment(ref totalSucceeded);
-                    else
-                    {
-                        Interlocked.Increment(ref totalFailed);
-                        errors.AddOrUpdate(
-                            $"HTTP {(int)response.StatusCode} {response.ReasonPhrase}",
-                            1, (_, old) => old + 1);
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    sw.Stop();
-                    Interlocked.Increment(ref totalFailed);
-                    errors.AddOrUpdate("Cancelled", 1, (_, old) => old + 1);
-                }
-                catch (Exception ex)
-                {
-                    sw.Stop();
-                    Interlocked.Increment(ref totalFailed);
-                    // Store only the exception type + first 80 chars to avoid noise
-                    var key = $"{ex.GetType().Name}: {ex.Message[..Math.Min(80, ex.Message.Length)]}";
-                    errors.AddOrUpdate(key, 1, (_, old) => old + 1);
-                }
-                finally
-                {
-                    Interlocked.Increment(ref totalCompleted);
-                    Interlocked.Add(ref totalElapsedMs, sw.ElapsedMilliseconds);
-                }
-            }
-        });
+    // Reset for clean test runs
+    public static void Reset()
+    {
+        Interlocked.Exchange(ref _instanceCount, 0);
+        Interlocked.Exchange(ref _totalCalls, 0L);
+    }
 }
-catch (OperationCanceledException)
+
+// ── Result models ─────────────────────────────────────────────────
+public record RequestResult(
+    int    RequestId,
+    int    InstanceId,
+    long   ElapsedMs,
+    string CardNumber);
+
+public class MockCardBalance
 {
-    // Ctrl+C — normal exit path
+    public string   CardNumber          { get; set; } = string.Empty;
+    public string   MaskedCard          { get; set; } = string.Empty;
+    public double   AvailableBalance    { get; set; }
+    public int      FetchedByInstanceId { get; set; }
+    public DateTime FetchedAt           { get; set; }
 }
-
-overallSw.Stop();
-await statsTask; // let the stats printer drain
-
-// ──────────────────────────────────────────────
-//  FINAL REPORT
-// ──────────────────────────────────────────────
-Console.WriteLine("\n╔══════════════════════════════════════════════════╗");
-Console.WriteLine("║                  FINAL REPORT                   ║");
-Console.WriteLine("╚══════════════════════════════════════════════════╝");
-
-long completed = Interlocked.Read(ref totalCompleted);
-long succeeded = Interlocked.Read(ref totalSucceeded);
-long failed    = Interlocked.Read(ref totalFailed);
-long elapsed   = Interlocked.Read(ref totalElapsedMs);
-double avgMs   = completed > 0 ? (double)elapsed / completed : 0;
-double rps     = overallSw.Elapsed.TotalSeconds > 0
-                 ? completed / overallSw.Elapsed.TotalSeconds
-                 : 0;
-
-Console.WriteLine($"  Wall-clock time   : {overallSw.Elapsed:mm\\:ss\\.fff}");
-Console.WriteLine($"  Total Completed   : {completed}");
-Console.WriteLine($"  ✓  Successes      : {succeeded}  ({Pct(succeeded, completed)}%)");
-Console.WriteLine($"  ✗  Failures       : {failed}  ({Pct(failed, completed)}%)");
-Console.WriteLine($"  Avg Response Time : {avgMs:F1} ms");
-Console.WriteLine($"  Throughput        : {rps:F1} req/s");
-
-if (!errors.IsEmpty)
-{
-    Console.WriteLine("\n  ── Error Breakdown ────────────────────────────");
-    foreach (var (msg, count) in errors.OrderByDescending(e => e.Value))
-        Console.WriteLine($"  [{count,5}x]  {msg}");
-}
-
-Console.WriteLine("\n  Test complete.");
-
-// ──────────────────────────────────────────────
-//  HELPERS
-// ──────────────────────────────────────────────
-void PrintStats()
-{
-    long c = Interlocked.Read(ref totalCompleted);
-    long s = Interlocked.Read(ref totalSucceeded);
-    long f = Interlocked.Read(ref totalFailed);
-    long e = Interlocked.Read(ref totalElapsedMs);
-    double avg = c > 0 ? (double)e / c : 0;
-
-    // Overwrite the current line for a ticker-style display
-    Console.Write(
-        $"\r  Completed: {c,6} | ✓ {s,6} | ✗ {f,5} | Avg: {avg,7:F1} ms   ");
-}
-
-static string Pct(long part, long total) =>
-    total == 0 ? "0.0" : (part * 100.0 / total).ToString("F1");
